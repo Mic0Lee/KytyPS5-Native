@@ -531,6 +531,11 @@ static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
 	}
 }
 
+// Milliseconds on the monotonic clock, for the flip log's timeline.
+static double FlipLogMs() {
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind kind,
                                   void* trigger_data) {
 	VideoOutEventQueues queues;
@@ -543,10 +548,7 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		return v != nullptr && v[0] == '1';
 	}();
 	if (log && !queues.empty()) {
-		struct timespec ts {};
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		std::fprintf(stderr, "vo [%.2f] event %d data %" PRIu64 " queues %zu\n",
-		             static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6, static_cast<int>(kind),
+		std::fprintf(stderr, "vo [%.2f] event %d data %" PRIu64 " queues %zu\n", FlipLogMs(), static_cast<int>(kind),
 		             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trigger_data)), queues.size());
 	}
 	for (const auto& registration: queues) {
@@ -1171,13 +1173,6 @@ static bool LogFlips() {
 		return v != nullptr && v[0] == '1';
 	}();
 	return on;
-}
-
-// Milliseconds on the monotonic clock, for the flip log's timeline.
-static double FlipLogMs() {
-	struct timespec ts {};
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6;
 }
 
 // KYTY_LOG_FLIPS=1 also logs what the title asks about flips and vblanks (a status call only when its
