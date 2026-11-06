@@ -50,6 +50,7 @@
 #include <utility>
 #include <vector>
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -58,6 +59,7 @@
 #include <sys/un.h>
 #include <ucontext.h>
 #include <unistd.h>
+#endif
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
@@ -67,9 +69,11 @@ namespace Libs::Graphics::NativeGpu {
 namespace {
 
 double NowSecShadow() {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void SleepShadow(std::chrono::nanoseconds duration) {
+	std::this_thread::sleep_for(duration);
 }
 
 // Held pieces (a guest wait the GPU could not take on its own) released since the last flip report:
@@ -899,6 +903,7 @@ void PlayPadRecording(std::string path, double elapsed) {
 }
 
 void StartControlSocket() {
+#if !defined(_WIN32)
 	const char* path = std::getenv("KYTY_NATIVE_GPU_CTL_SOCK");
 	path             = path != nullptr && path[0] != '\0' ? path : "/tmp/kyty-ctl.sock";
 	const int fd     = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -956,6 +961,7 @@ void StartControlSocket() {
 			::close(c);
 		}
 	}).detach();
+#endif
 }
 
 // GET_LOD_STATS the way the PS5 does it: the GPU's PRT LOD statistics reporter counts texture samples
@@ -981,6 +987,7 @@ public:
 		return Connect("/run/kyty-lodhw.sock") || Connect("/tmp/kyty-lodhw.sock");
 	}
 	bool Connect(const char* path) {
+#if !defined(_WIN32)
 		const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
 		if (fd < 0) {
 			return false;
@@ -994,17 +1001,26 @@ public:
 		}
 		m_fd = fd;
 		return true;
+#else
+		(void)path;
+		return false;
+#endif
 	}
 	[[nodiscard]] bool On() const { return m_fd >= 0; }
 	void Disconnect() {
 		std::lock_guard<std::mutex> lock(m_mutex);
+#if !defined(_WIN32)
 		if (m_fd >= 0) {
 			::close(m_fd);
 			m_fd = -1;
 		}
+#else
+		m_fd = -1;
+#endif
 	}
 	// The PASID of the VM on `drm_fd` (its /proc fdinfo "pasid:" line); 0 when not found.
 	static uint32_t Pasid(int drm_fd) {
+#if !defined(_WIN32)
 		char path[64];
 		std::snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", drm_fd);
 		FILE*    f     = std::fopen(path, "re");
@@ -1020,6 +1036,10 @@ public:
 			std::fclose(f);
 		}
 		return pasid;
+#else
+		(void)drm_fd;
+		return 0;
+#endif
 	}
 	void SetPasid(uint32_t pasid) { m_pasid = pasid; }
 	// One report of `size` bytes at `va` in whichever VMID serves this VM now, finished when this
@@ -1126,6 +1146,7 @@ private:
 			}
 		} account {this, (op & 0xffu) % kOps, t0};
 		std::lock_guard<std::mutex> lock(m_mutex);
+#if !defined(_WIN32)
 		if (m_fd < 0) {
 			return -ENOTCONN;
 		}
@@ -1147,6 +1168,12 @@ private:
 			*value = r.value;
 		}
 		return r.status;
+#else
+		(void)size;
+		(void)va;
+		(void)value;
+		return -1;
+#endif
 	}
 
 	std::mutex m_mutex;
@@ -2065,8 +2092,7 @@ public:
 		const double t0 = NowSecShadow();
 		while (m_stream != StreamState::Off && NowSecShadow() - t0 < m_timeout_sec) {
 			lock.unlock();
-			struct timespec nap = {0, 200000};
-			nanosleep(&nap, nullptr);
+			SleepShadow(std::chrono::microseconds(200));
 			lock.lock();
 		}
 		struct HoldEnd {
@@ -2163,8 +2189,7 @@ public:
 			std::thread([] {
 				for (;;) {
 					const double    t0  = NowSecShadow();
-					struct timespec nap = {0, 1000000};
-					nanosleep(&nap, nullptr);
+					SleepShadow(std::chrono::milliseconds(1));
 					const auto late = static_cast<uint64_t>(std::max(0.0, (NowSecShadow() - t0) * 1e6 - 1000.0));
 					if (late > 4000) {
 						stalls.fetch_add(1, std::memory_order_relaxed);
@@ -2177,10 +2202,19 @@ public:
 			return true;
 		}();
 		(void)watch;
+#if !defined(_WIN32)
 		static struct rusage ru_prev {};
 		static uint64_t      irq_timeouts_prev = 0; // m_irq_timeouts at the previous flip
 		struct rusage        ru {};
 		getrusage(RUSAGE_SELF, &ru);
+		const long minflt = ru.ru_minflt - ru_prev.ru_minflt;
+		const long majflt = ru.ru_majflt - ru_prev.ru_majflt;
+		const long nvcsw  = ru.ru_nvcsw - ru_prev.ru_nvcsw;
+		const long nivcsw = ru.ru_nivcsw - ru_prev.ru_nivcsw;
+#else
+		static uint64_t irq_timeouts_prev = 0;
+		const long      minflt = 0, majflt = 0, nvcsw = 0, nivcsw = 0;
+#endif
 		const double stall_ms   = static_cast<double>(stall_max_us.exchange(0, std::memory_order_relaxed)) * 1e-3;
 		const auto   stall_n    = stalls.exchange(0, std::memory_order_relaxed);
 		const double dcb_ago_ms   = (now - m_trace_last_dcb.load(std::memory_order_relaxed)) * 1e3;
@@ -2284,8 +2318,7 @@ public:
 			             static_cast<unsigned long long>(cur.acbs - prev.acbs), (cur.acb_dw - prev.acb_dw) / 1e3,
 			             static_cast<unsigned long long>(cur.irqs - prev.irqs), static_cast<unsigned long long>(cur.waits - prev.waits),
 			             static_cast<unsigned long long>(cur.labels - prev.labels), span_ms, spans, wait_ms, waits, dcb_ago_ms, stall_ms,
-			             static_cast<unsigned long long>(stall_n), ru.ru_minflt - ru_prev.ru_minflt, ru.ru_majflt - ru_prev.ru_majflt,
-			             ru.ru_nvcsw - ru_prev.ru_nvcsw, ru.ru_nivcsw - ru_prev.ru_nivcsw, guest_ago_ms,
+			             static_cast<unsigned long long>(stall_n), minflt, majflt, nvcsw, nivcsw, guest_ago_ms,
 			             static_cast<unsigned long long>(m_irq_timeouts.load(std::memory_order_relaxed) - irq_timeouts_prev),
 			             m_trace_dcb_latency.load(std::memory_order_relaxed) * 1e3, m_trace_game_gap.load(std::memory_order_relaxed) * 1e3,
 			             m_trace_acb_gap.load(std::memory_order_relaxed) * 1e3, m_trace_acb_latency_max.exchange(0.0) * 1e3);
@@ -2294,7 +2327,9 @@ public:
 			}
 		}
 		prev              = cur;
+#if defined(__linux__)
 		ru_prev           = ru;
+#endif
 		irq_timeouts_prev = m_irq_timeouts.load(std::memory_order_relaxed);
 		flip++;
 	}
@@ -3394,7 +3429,7 @@ private:
 		char why[32];
 		std::snprintf(why, sizeof(why), "signal %d", sig);
 		StopGpu(why);
-		::_exit(128 + sig);
+		std::_Exit(128 + sig);
 	}
 
 public:
@@ -3508,8 +3543,7 @@ public:
 		// Another thread may hold the lock while it waits on the GPU, for the very ring this releases.
 		std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
 		for (int i = 0; i < 100 && !lock.try_lock(); i++) {
-			struct timespec nap = {0, 1000000};
-			nanosleep(&nap, nullptr);
+			SleepShadow(std::chrono::milliseconds(1));
 		}
 		if (lock.owns_lock()) {
 			m_disabled = true;
@@ -3608,8 +3642,7 @@ public:
 			if (each_round) {
 				each_round();
 			}
-			struct timespec nap = {0, 2000000};
-			nanosleep(&nap, nullptr);
+			SleepShadow(std::chrono::milliseconds(2));
 		}
 		m_stop_idle = idle;
 		std::fprintf(stderr,
@@ -3651,8 +3684,7 @@ public:
 	bool EndStreamForStop() {
 #if KYTY_GEM_BACKING_SUPPORTED
 		while (m_stream_pub.test_and_set(std::memory_order_acquire)) {
-			struct timespec nap = {0, 50000};
-			nanosleep(&nap, nullptr);
+			SleepShadow(std::chrono::microseconds(50));
 		}
 		volatile uint8_t* sc   = m_submitter->ScratchCpu();
 		const uint32_t    flag = *reinterpret_cast<volatile uint32_t*>(sc + kStreamFlagOffset);
@@ -3778,20 +3810,19 @@ public:
 					outcome = "idle late";
 					break;
 				}
-				struct timespec nap = {0, 20000000};
-				nanosleep(&nap, nullptr);
+				SleepShadow(std::chrono::milliseconds(20));
 			}
 		}
 		WriteGpuFault(trigger, outcome);
 		std::fprintf(stderr, "native watch: %s: title's GPU work %s, exit %d\n", trigger.c_str(), outcome, m_watch_exit_code);
 		std::fflush(stderr);
 		std::fflush(stdout);
-		::_exit(m_watch_exit_code);
+		std::_Exit(m_watch_exit_code);
 #else
 		(void)trigger;
 		(void)deadline;
 		(void)reset_seen;
-		::_exit(m_watch_exit_code);
+		std::_Exit(m_watch_exit_code);
 #endif
 	}
 
@@ -3867,9 +3898,10 @@ public:
 		double               logged_prog   = -1.0;
 		WatchTrigger         logged_kind   = WatchTrigger::None;
 		double               not_ours_prog = -1.0;
-		const struct timespec nap          = {0, static_cast<long>(m_watch_poll_ms * 1e6)};
+		const auto nap = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::duration<double, std::milli>(m_watch_poll_ms));
 		for (;;) {
-			nanosleep(&nap, nullptr);
+			SleepShadow(nap);
 			if (m_stopping.load(std::memory_order_acquire) || m_failure_taken.load(std::memory_order_acquire)) {
 				return; // a stop is under way elsewhere (exit, a signal, the submit side's failure)
 			}
@@ -3955,8 +3987,7 @@ public:
 				const uint32_t mine = m_watch_hw.GfxVmid(m_watch_pasid);
 				uint32_t       v0 = 0, v1 = 0;
 				const int      r0 = m_watch_hw.ReadReg(0x1260u + 0x1e81u, LodStatsHw::SelHqd(0, 0, 0), &v0);
-				struct timespec gap = {0, 20000000};
-				nanosleep(&gap, nullptr);
+				SleepShadow(std::chrono::milliseconds(20));
 				const int r1 = m_watch_hw.ReadReg(0x1260u + 0x1e81u, LodStatsHw::SelHqd(0, 0, 0), &v1);
 				v0 &= 0xfu;
 				v1 &= 0xfu;
@@ -3989,8 +4020,7 @@ public:
 			if (!m_hang_dump.empty()) {
 				std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
 				for (int i = 0; i < 50 && !lock.try_lock(); i++) {
-					struct timespec ms = {0, 1000000};
-					nanosleep(&ms, nullptr);
+					SleepShadow(std::chrono::milliseconds(1));
 				}
 				if (lock.owns_lock()) {
 					DumpHangLocked();
@@ -4566,8 +4596,7 @@ private:
 				if (NowSecShadow() - t0 > m_timeout_sec) {
 					break; // a hung ring: its timeout disables the path anyway
 				}
-				struct timespec nap = {0, 50000};
-				nanosleep(&nap, nullptr);
+				SleepShadow(std::chrono::microseconds(50));
 			}
 			const double waited = NowSecShadow() - t0;
 			m_stream_wait_s += waited;
@@ -4578,8 +4607,7 @@ private:
 			return;
 		}
 		while (m_stream_pub.test_and_set(std::memory_order_acquire)) {
-			struct timespec nap = {0, 50000};
-			nanosleep(&nap, nullptr);
+			SleepShadow(std::chrono::microseconds(50));
 		}
 		struct PubEnd {
 			std::atomic_flag& f;
@@ -4709,8 +4737,7 @@ private:
 			std::fprintf(stderr, "native inject: stream at dcb %llu: chunk %u published 3.5 s late\n", static_cast<unsigned long long>(m_frames),
 			             m_stream_pending);
 			std::fflush(stderr);
-			struct timespec nap = {3, 500000000};
-			nanosleep(&nap, nullptr);
+			SleepShadow(std::chrono::milliseconds(3500));
 		}
 		PublishStreamLocked(m_stream_pending, va, ib.size());
 		if (AuditOn()) { // the head's job goes on, and its waits are the GPU's from now on
@@ -4859,8 +4886,7 @@ private:
 			static const char* const kNames[] = {"idle (waiting for the next DCB)", "translate", "residency", "GPU submit/wait"};
 			double reported = -1.0;
 			for (;;) {
-				struct timespec nap = {2, 0};
-				nanosleep(&nap, nullptr);
+				SleepShadow(std::chrono::seconds(2));
 				const double since = m_stage_since.load(std::memory_order_relaxed);
 				const double stuck = NowSecShadow() - since;
 				if (since > 0.0 && stuck >= 10.0 && since != reported) {
@@ -7953,8 +7979,7 @@ private:
 				          });
 			}
 			if (pending) {
-				struct timespec nap = {0, 1000000};
-				nanosleep(&nap, nullptr);
+				SleepShadow(std::chrono::milliseconds(1));
 			}
 		}
 	}
@@ -8421,6 +8446,7 @@ bool TakeLodStatsBanks(uint64_t addr, std::bitset<256>& banks) {
 	return LodBankScanOn() && Shadow::Instance().Active() && LodStatsReports().Take(addr, banks);
 }
 
+#if defined(__linux__)
 namespace {
 
 // KYTY_LOD_STATS_TRAP: pages of LOD statistics buffers made inaccessible. Each CPU access is logged
@@ -8561,6 +8587,20 @@ bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_con
 	}
 	return false;
 }
+#else
+void LodStatsTrapArm(uint64_t addr, uint64_t size) {
+	(void)addr;
+	(void)size;
+}
+
+bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context) {
+	(void)vaddr;
+	(void)pc;
+	(void)write;
+	(void)native_context;
+	return false;
+}
+#endif
 
 bool PrimaryRendering() {
 	static const bool primary = EnvOn("KYTY_NATIVE_GPU_PRIMARY");
