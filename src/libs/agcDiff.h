@@ -33,6 +33,16 @@ struct CommandBuffer;
 
 namespace AgcDiff {
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+using ReferenceJumpBuffer = jmp_buf;
+#define KYTY_AGC_DIFF_SETJMP(env) setjmp(env)
+#define KYTY_AGC_DIFF_LONGJMP(env, value) longjmp(env, value)
+#else
+using ReferenceJumpBuffer = sigjmp_buf;
+#define KYTY_AGC_DIFF_SETJMP(env) sigsetjmp(env, 1)
+#define KYTY_AGC_DIFF_LONGJMP(env, value) siglongjmp(env, value)
+#endif
+
 // KYTY_AGC_REFERENCE is set (decided when the exports are registered).
 bool  Requested();
 // key: the wrapper registered for the export (Wrap<F, Tag>::Call).
@@ -101,15 +111,15 @@ uint32_t* InitState(const void* key);
 
 // A reference call that faults comes back here (the host fault handler jumps to t_reference_jmp)
 // and its export is not called again.
-extern thread_local sigjmp_buf* t_reference_jmp;
+extern thread_local ReferenceJumpBuffer* t_reference_jmp;
 extern thread_local uint64_t    t_fault_pc;
 extern thread_local uint64_t    t_fault_addr;
 void Faulted(const void* key);
 
 template <typename Fn>
 bool Guarded(const void* key, Fn&& fn) {
-	sigjmp_buf jb;
-	if (sigsetjmp(jb, 1) != 0) {
+	ReferenceJumpBuffer jb;
+	if (KYTY_AGC_DIFF_SETJMP(jb) != 0) {
 		t_reference_jmp = nullptr;
 		Faulted(key);
 		return false;

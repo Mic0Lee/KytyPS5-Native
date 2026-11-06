@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csetjmp>
 #include <cstdarg>
@@ -45,6 +47,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <pthread.h>
+#endif
 
 #ifdef min
 #undef min
@@ -5090,7 +5096,7 @@ int KYTY_SYSV_ABI AgcGetSemaphoreLabel(uint32_t index, void** label) {
 
 namespace AgcDiff {
 
-thread_local sigjmp_buf* t_reference_jmp = nullptr;
+thread_local ReferenceJumpBuffer* t_reference_jmp = nullptr;
 thread_local uint64_t    t_fault_pc      = 0;
 thread_local uint64_t    t_fault_addr    = 0;
 
@@ -5177,15 +5183,15 @@ void Load() {
 		if (init_env == nullptr || init_env[0] != '1' || program->file_name.string().find("Driver") != std::string::npos) {
 			continue;
 		}
-		sigjmp_buf jb;
-		int        result = 0;
-		if (sigsetjmp(jb, 1) == 0) {
+		ReferenceJumpBuffer jb;
+		int                 result = 0;
+		if (KYTY_AGC_DIFF_SETJMP(jb) == 0) {
 			t_reference_jmp = &jb;
 			Loader::g_reference_fault_hook = [](uint64_t pc, uint64_t addr) {
 				if (t_reference_jmp != nullptr) {
 					t_fault_pc   = pc;
 					t_fault_addr = addr;
-					siglongjmp(*t_reference_jmp, 1);
+					KYTY_AGC_DIFF_LONGJMP(*t_reference_jmp, 1);
 				}
 			};
 			result = rt->StartModule(program, 0, nullptr, nullptr);
@@ -5222,7 +5228,7 @@ void Load() {
 		if (t_reference_jmp != nullptr) {
 			t_fault_pc   = pc;
 			t_fault_addr = addr;
-			siglongjmp(*t_reference_jmp, 1);
+			KYTY_AGC_DIFF_LONGJMP(*t_reference_jmp, 1);
 		}
 	};
 	std::atexit(Summary);
@@ -5818,9 +5824,9 @@ static void LogSubmit(const char* what, uint32_t queue, uint32_t size_in_dwords)
 	if (!on) {
 		return;
 	}
-	struct timespec ts {};
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	const double           now  = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+	const double           now  = std::chrono::duration<double>(
+	                                  std::chrono::steady_clock::now().time_since_epoch())
+	                                  .count();
 	thread_local double    last = 0.0;
 	thread_local uint32_t  run  = 0;
 	const bool             acb  = what[0] == 'a';
@@ -5830,7 +5836,12 @@ static void LogSubmit(const char* what, uint32_t queue, uint32_t size_in_dwords)
 		return;
 	}
 	char name[32] = "?";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const std::string thread_id = Common::Thread::GetThreadId();
+	std::snprintf(name, sizeof(name), "%s", thread_id.c_str());
+#else
 	pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
 	std::fprintf(stderr, "submit: %s %.4f thread %s queue %u dwords %u (%u before in the last burst)\n", what, now, name, queue,
 	             size_in_dwords, acb ? run : 0u);
 	last = now;
@@ -5917,7 +5928,12 @@ static void NoteAgrSubmit(const char* what, uint32_t dcbs, uint32_t dwords, uint
 		return;
 	}
 	char name[32] = "?";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const std::string thread_id = Common::Thread::GetThreadId();
+	std::snprintf(name, sizeof(name), "%s", thread_id.c_str());
+#else
 	pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
 	std::fprintf(stderr, "agc: AGR %s call %" PRIu64 " (thread %s): %u DCBs, %u dwords, flags 0x%02x\n", what, n, name, dcbs,
 	             dwords, flags);
 }
