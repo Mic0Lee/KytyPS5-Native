@@ -143,13 +143,13 @@ uint64_t ToU64(T v) {
 
 // One instance per registration (Tag): the same HLE function can stand for two exports (DCB and
 // asynchronous variants) that the real library implements separately.
-template <auto F, int Tag>
+template <auto F, int Tag, typename Signature = decltype(F)>
 struct Wrap;
 
-template <typename R, typename... A, R (*F)(A...), int Tag>
-struct Wrap<F, Tag> {
+template <auto F, int Tag, typename R, typename... A>
+struct Wrap<F, Tag, R (KYTY_SYSV_ABI *)(A...)> {
 	static KYTY_SYSV_ABI R Call(A... a) {
-		using Fn          = R (*)(A...);
+		using Fn          = R (KYTY_SYSV_ABI *)(A...);
 		const void* key   = reinterpret_cast<const void*>(&Call);
 		auto*       ref   = reinterpret_cast<Fn>(Reference(key));
 		using First       = std::tuple_element_t<0, std::tuple<A..., void>>;
