@@ -6,6 +6,10 @@
 
 #include <type_traits>
 
+#ifdef pthread_attr_getguardsize
+#undef pthread_attr_getguardsize
+#endif
+
 // IWYU pragma: no_include <pthread.h>
 
 extern "C" {
