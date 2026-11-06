@@ -1403,7 +1403,9 @@ public:
 			return false;
 		}
 
+#if KYTY_GEM_BACKING_SUPPORTED
 		SyncCollectRefs();
+#endif
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
 		const char* const  kind  = acb ? "acb" : "frame";
 		if (!acb) {
@@ -1670,7 +1672,9 @@ public:
 			if (NowSecShadow() - start_s < inspect_after) {
 				break;
 			}
+#if KYTY_GEM_BACKING_SUPPORTED
 			InspectDraw(frame, snap);
+#endif
 		}
 		// A shader that uses GDS runs natively when every job has the GDS partition, as on the PS5. Without one
 		// (KYTY_NATIVE_GPU_GDS=0, or amdgpu gave none) its DCB stays on Kyty, as with KYTY_NATIVE_GPU_GDS_SHADERS=0. The
@@ -2228,6 +2232,7 @@ public:
 		static uint64_t   flip = 0;
 		// GPU clock pairs finished since the last flip, in order; a pair without its begin (a dropped first
 		// segment) or long unfinished (a refused buffer) is skipped.
+#if KYTY_GEM_BACKING_SUPPORTED
 		static uint64_t span_from = 0, wait_from = 0;
 		// GPU wait time by who writes the label (KYTY_NATIVE_GPU_FLIP_TRACE=gpu), printed every 600 flips:
 		// an ACB translated before the DCB that waits on it, one translated after it (by how long), the
@@ -2281,9 +2286,6 @@ public:
 			}
 			return ms;
 		};
-		uint32_t     spans = 0, waits = 0;
-		const double span_ms = take(kGpuTimesOffset, span_from, m_translator.GpuSpansNext(), &spans, false);
-		const double wait_ms = take(kGpuTimesOffset + 16ull * kGpuTimesPairs, wait_from, m_translator.GpuWaitsNext(), &waits, true);
 		if (flip % 600 == 599 && !by_writer.empty()) {
 			double total = 0;
 			for (const auto& [key, agg]: by_writer) {
@@ -2300,6 +2302,13 @@ public:
 			}
 			by_writer.clear();
 		}
+		uint32_t     spans = 0, waits = 0;
+		const double span_ms = take(kGpuTimesOffset, span_from, m_translator.GpuSpansNext(), &spans, false);
+		const double wait_ms = take(kGpuTimesOffset + 16ull * kGpuTimesPairs, wait_from, m_translator.GpuWaitsNext(), &waits, true);
+#else
+		const double span_ms = 0.0, wait_ms = 0.0;
+		const uint32_t spans = 0, waits = 0;
+#endif
 		const Mark cur {now, m_translate_ms_total, m_trace_busy_s, m_trace_gpu_busy_s.load(std::memory_order_relaxed),
 		                m_frames, m_acbs, m_trace_dw[0], m_trace_dw[1], m_labels_stats[2], m_labels_stats[3], m_labels_stats[0]};
 		if (f == nullptr) {
@@ -2327,7 +2336,7 @@ public:
 			}
 		}
 		prev              = cur;
-#if defined(__linux__)
+#if !defined(_WIN32)
 		ru_prev           = ru;
 #endif
 		irq_timeouts_prev = m_irq_timeouts.load(std::memory_order_relaxed);
@@ -2562,9 +2571,11 @@ public:
 #endif
 			// The pipelined path never reaches the per-submission check: look at the dummy here. The GPU
 			// may be writing it right now; a write that lands during the clear is caught next time.
+#if KYTY_GEM_BACKING_SUPPORTED
 			if (m_gem != nullptr && m_gem->DummyWritten()) {
 				m_dummy_writes++;
 			}
+#endif
 			if (m_dummy_writes > 0) {
 				std::fprintf(stderr, "native shadow: %u checks found GPU writes to non-resident guest memory\n",
 				             m_dummy_writes);
@@ -2972,7 +2983,13 @@ public:
 		return false;
 #endif
 	}
-	uint32_t KfdQueueCount() const { return std::max(m_submitter != nullptr ? m_submitter->KfdQueueCount() : 0u, 1u); }
+	uint32_t KfdQueueCount() const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return std::max(m_submitter != nullptr ? m_submitter->KfdQueueCount() : 0u, 1u);
+#else
+		return 1;
+#endif
+	}
 
 	// The per-VMID PS5 settings follow this VM's gfx VMID, which amdgpu may change between jobs: once
 	// per flip they move to the VMID it holds now and the one it left gets the Linux values back.
@@ -3153,6 +3170,7 @@ public:
 		e = StreamEvent {NowSecShadow(), what, n, a, b};
 	}
 	void DumpStreamJournal() {
+#if KYTY_GEM_BACKING_SUPPORTED
 		if (m_stream_journal_at == 0 || m_submitter == nullptr) {
 			return;
 		}
@@ -3167,8 +3185,10 @@ public:
 			std::fprintf(stderr, "  %.4f %c n=%u 0x%llx 0x%llx\n", e.t, e.what, e.n, static_cast<unsigned long long>(e.a),
 			             static_cast<unsigned long long>(e.b));
 		}
+#endif
 	}
 	void StreamBegin() {
+#if KYTY_GEM_BACKING_SUPPORTED
 		std::lock_guard<std::mutex> lock(m_mutex);
 		NoteStream('B', m_stream_counter, static_cast<uint64_t>(m_stream), m_stream_hold ? 1 : 0);
 		if (m_submitter == nullptr || !m_submitter->Async() || m_stream_hold) {
@@ -3189,6 +3209,7 @@ public:
 		}
 		m_stream       = StreamState::Head;
 		m_stream_final = false;
+#endif
 	}
 	void StreamFinal() {
 		std::lock_guard<std::mutex> lock(m_mutex);
@@ -4526,9 +4547,11 @@ private:
 	}
 
 	void AppendToBatchLocked(const std::vector<uint32_t>& ib) {
+#if KYTY_GEM_BACKING_SUPPORTED
 		if ((m_batch.size() + ib.size() + kCpShadowOff.size()) * 4 > NativeSubmitter::kSlotSize) {
 			SubmitBatchLocked();
 		}
+#endif
 		m_batch.insert(m_batch.end(), ib.begin(), ib.end());
 	}
 
@@ -4548,6 +4571,7 @@ private:
 	}
 #endif
 
+#if KYTY_GEM_BACKING_SUPPORTED
 	// The CP waits (PFP, so it parses nothing past it) until the stream counter reaches `n`, then chains
 	// to trampoline `n`, 8 dwords that PublishStreamLocked fills.
 	// `shadow_on`: CP shadowing is on where the wait sits (the stream is the shadowing translator's). With the wait wrap
@@ -4643,6 +4667,7 @@ private:
 			Audit().StreamClosed(NowSecShadow());
 		}
 	}
+#endif
 	void StreamFlushLocked(std::vector<uint32_t>& batch) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_stream == StreamState::Head) {
